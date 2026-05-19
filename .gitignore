@@ -1,0 +1,39 @@
+# ── 보안/인증 ──
+.env
+*.env
+.env.*
+
+# ── 로그 ──
+logs/
+*.log
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── 데이터/백업 ──
+*.sql
+*.csv
+*.xlsx
+*.db
+*.sqlite3
+backup/
+data/
