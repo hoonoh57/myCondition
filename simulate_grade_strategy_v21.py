@@ -5,6 +5,11 @@ ScoringModel v2.1 등급별 실전형 매매 시뮬레이션
     grade_v21별 목표수익/손절/최대보유기간 정책을 적용하여
     ret_max가 아니라 실제 일봉 경로 기반의 실현수익률을 계산합니다.
 
+v2.2 기본 정책 반영:
+    - C_HOT은 일봉 stop_first 기준에서 양수 조합이 없으므로 기본 매매 비활성.
+      장중 틱/분봉 확인 전용 후보군으로 유지합니다.
+    - C_FAST는 stop_first 기준에서도 양수 조합이 확인되어 +15/-6/2일 정책 적용.
+
 핵심:
     - 진입가: scan_result.close_price
     - 진입일: scan_result.search_date 종가 진입으로 간주
@@ -13,10 +18,11 @@ ScoringModel v2.1 등급별 실전형 매매 시뮬레이션
     - 수수료/세금/슬리피지 반영
 
 Usage:
-    python simulate_grade_strategy_v21.py --dry-run --limit 20
+    python simulate_grade_strategy_v21.py --limit 20
     python simulate_grade_strategy_v21.py
-    python simulate_grade_strategy_v21.py --same-day-policy target_first
-    python simulate_grade_strategy_v21.py --export-csv outputs/reports/grade_strategy_v21.csv
+    python simulate_grade_strategy_v21.py --include-disabled
+    python simulate_grade_strategy_v21.py --same-day-policy open_proximity
+    python simulate_grade_strategy_v21.py --export-csv outputs/reports/grade_strategy_v21_v22_policy.csv
 
 주의:
     이 스크립트는 DB를 수정하지 않습니다. 결과는 로그/CSV로만 출력합니다.
@@ -27,7 +33,6 @@ import logging
 import sys
 from collections import defaultdict
 from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
 
 import pymysql
@@ -60,9 +65,9 @@ POLICIES = {
     "A2": {"target": 20.0, "stop": -4.0, "max_days": 20, "position_pct": 80, "enabled": True},
     "B1": {"target": 25.0, "stop": -5.0, "max_days": 10, "position_pct": 60, "enabled": True},
     "B2": {"target": 15.0, "stop": -4.0, "max_days": 10, "position_pct": 50, "enabled": True},
-    "C_HOT": {"target": 20.0, "stop": -5.0, "max_days": 10, "position_pct": 50, "enabled": True},
-    "C_FAST": {"target": 15.0, "stop": -4.0, "max_days": 3, "position_pct": 30, "enabled": True},
-    "C_WATCH": {"target": 10.0, "stop": -3.0, "max_days": 3, "position_pct": 10, "enabled": False},
+    "C_HOT": {"target": 8.0, "stop": -8.0, "max_days": 2, "position_pct": 0, "enabled": False},
+    "C_FAST": {"target": 15.0, "stop": -6.0, "max_days": 2, "position_pct": 30, "enabled": True},
+    "C_WATCH": {"target": 0.0, "stop": 0.0, "max_days": 0, "position_pct": 0, "enabled": False},
     "C_BAD": {"target": 0.0, "stop": 0.0, "max_days": 0, "position_pct": 0, "enabled": False},
     "D": {"target": 0.0, "stop": 0.0, "max_days": 0, "position_pct": 0, "enabled": False},
 }
@@ -120,7 +125,10 @@ def build_where(condition_name, start_date, end_date, enabled_only):
         clauses.append("search_date <= %s")
         params.append(end_date)
     if enabled_only:
-        clauses.append("grade_v21 IN ('A1','A2','B1','B2','C_HOT','C_FAST')")
+        enabled_grades = [g for g, p in POLICIES.items() if p["enabled"]]
+        placeholders = ",".join(["%s"] * len(enabled_grades))
+        clauses.append(f"grade_v21 IN ({placeholders})")
+        params.extend(enabled_grades)
 
     return "WHERE " + " AND ".join(clauses), params
 
@@ -294,22 +302,12 @@ def simulate_one(row, candles, args):
 def calc_stats(rows):
     count = len(rows)
     if count == 0:
-        return {
-            "cnt": 0, "traded": 0, "win_rate": 0.0, "avg_net": 0.0, "avg_weighted": 0.0,
-            "avg_gross": 0.0, "avg_hold": 0.0, "target_rate": 0.0, "stop_rate": 0.0,
-            "time_rate": 0.0, "avg_max_intra": 0.0, "avg_min_intra": 0.0,
-            "best_net": 0.0, "worst_net": 0.0,
-        }
+        return {"cnt": 0, "traded": 0, "win_rate": 0.0, "avg_net": 0.0, "avg_weighted": 0.0, "avg_gross": 0.0, "avg_hold": 0.0, "target_rate": 0.0, "stop_rate": 0.0, "time_rate": 0.0, "avg_max_intra": 0.0, "avg_min_intra": 0.0, "best_net": 0.0, "worst_net": 0.0}
 
     traded = [r for r in rows if int(r.get("trade_enabled", 0)) == 1 and r.get("exit_reason") not in ("disabled", "no_future_candles")]
     traded_count = len(traded)
     if traded_count == 0:
-        return {
-            "cnt": count, "traded": 0, "win_rate": 0.0, "avg_net": 0.0, "avg_weighted": 0.0,
-            "avg_gross": 0.0, "avg_hold": 0.0, "target_rate": 0.0, "stop_rate": 0.0,
-            "time_rate": 0.0, "avg_max_intra": 0.0, "avg_min_intra": 0.0,
-            "best_net": 0.0, "worst_net": 0.0,
-        }
+        return {"cnt": count, "traded": 0, "win_rate": 0.0, "avg_net": 0.0, "avg_weighted": 0.0, "avg_gross": 0.0, "avg_hold": 0.0, "target_rate": 0.0, "stop_rate": 0.0, "time_rate": 0.0, "avg_max_intra": 0.0, "avg_min_intra": 0.0, "best_net": 0.0, "worst_net": 0.0}
 
     net_vals = [safe_float(r.get("net_return")) for r in traded]
     weighted_vals = [safe_float(r.get("weighted_net_return")) for r in traded]
@@ -350,21 +348,12 @@ def print_stats(results):
     logger.info("=" * 150)
     logger.info("v2.1 등급별 실전형 시뮬레이션 결과")
     logger.info("=" * 150)
-    logger.info(
-        "%10s | %5s | %6s | %7s | %8s | %8s | %8s | %7s | %7s | %7s | %7s | %8s | %8s | %8s | %8s",
-        "grade", "cnt", "trade", "win%", "avgNet", "wNet", "avgGross", "hold", "target", "stop", "time", "maxIntra", "minIntra", "best", "worst",
-    )
+    logger.info("%10s | %5s | %6s | %7s | %8s | %8s | %8s | %7s | %7s | %7s | %7s | %8s | %8s | %8s | %8s", "grade", "cnt", "trade", "win%", "avgNet", "wNet", "avgGross", "hold", "target", "stop", "time", "maxIntra", "minIntra", "best", "worst")
     logger.info("-" * 150)
 
     for grade in GRADE_ORDER:
         stats = calc_stats(groups.get(grade, []))
-        logger.info(
-            "%10s | %5d | %6d | %6.1f%% | %+7.2f%% | %+7.2f%% | %+7.2f%% | %6.2f | %6.1f%% | %6.1f%% | %6.1f%% | %+7.2f%% | %+7.2f%% | %+7.2f%% | %+7.2f%%",
-            grade,
-            stats["cnt"], stats["traded"], stats["win_rate"], stats["avg_net"], stats["avg_weighted"],
-            stats["avg_gross"], stats["avg_hold"], stats["target_rate"], stats["stop_rate"], stats["time_rate"],
-            stats["avg_max_intra"], stats["avg_min_intra"], stats["best_net"], stats["worst_net"],
-        )
+        logger.info("%10s | %5d | %6d | %6.1f%% | %+7.2f%% | %+7.2f%% | %+7.2f%% | %6.2f | %6.1f%% | %6.1f%% | %6.1f%% | %+7.2f%% | %+7.2f%% | %+7.2f%% | %+7.2f%%", grade, stats["cnt"], stats["traded"], stats["win_rate"], stats["avg_net"], stats["avg_weighted"], stats["avg_gross"], stats["avg_hold"], stats["target_rate"], stats["stop_rate"], stats["time_rate"], stats["avg_max_intra"], stats["avg_min_intra"], stats["best_net"], stats["worst_net"])
 
 
 def print_top_bottom(results, grade, top_n):
@@ -376,22 +365,12 @@ def print_top_bottom(results, grade, top_n):
     logger.info("")
     logger.info("[%s] net_return 상위 %d", grade, top_n)
     for i, r in enumerate(rows[:top_n], 1):
-        logger.info(
-            "%3d. [%s] %-18s(%s) net=%+7.2f%% gross=%+7.2f%% reason=%s hold=%s entry=%.2f exit=%.2f ret_max=%+7.2f%%",
-            i, safe_date_text(r.get("search_date")), str(r.get("name"))[:18], r.get("code"),
-            safe_float(r.get("net_return")), safe_float(r.get("gross_return")), r.get("exit_reason"),
-            r.get("holding_days"), safe_float(r.get("entry_price")), safe_float(r.get("exit_price")), safe_float(r.get("ret_max")),
-        )
+        logger.info("%3d. [%s] %-18s(%s) net=%+7.2f%% gross=%+7.2f%% reason=%s hold=%s entry=%.2f exit=%.2f ret_max=%+7.2f%%", i, safe_date_text(r.get("search_date")), str(r.get("name"))[:18], r.get("code"), safe_float(r.get("net_return")), safe_float(r.get("gross_return")), r.get("exit_reason"), r.get("holding_days"), safe_float(r.get("entry_price")), safe_float(r.get("exit_price")), safe_float(r.get("ret_max")))
 
     logger.info("")
     logger.info("[%s] net_return 하위 %d", grade, top_n)
     for i, r in enumerate(list(reversed(rows[-top_n:])), 1):
-        logger.info(
-            "%3d. [%s] %-18s(%s) net=%+7.2f%% gross=%+7.2f%% reason=%s hold=%s entry=%.2f exit=%.2f ret_max=%+7.2f%%",
-            i, safe_date_text(r.get("search_date")), str(r.get("name"))[:18], r.get("code"),
-            safe_float(r.get("net_return")), safe_float(r.get("gross_return")), r.get("exit_reason"),
-            r.get("holding_days"), safe_float(r.get("entry_price")), safe_float(r.get("exit_price")), safe_float(r.get("ret_max")),
-        )
+        logger.info("%3d. [%s] %-18s(%s) net=%+7.2f%% gross=%+7.2f%% reason=%s hold=%s entry=%.2f exit=%.2f ret_max=%+7.2f%%", i, safe_date_text(r.get("search_date")), str(r.get("name"))[:18], r.get("code"), safe_float(r.get("net_return")), safe_float(r.get("gross_return")), r.get("exit_reason"), r.get("holding_days"), safe_float(r.get("entry_price")), safe_float(r.get("exit_price")), safe_float(r.get("ret_max")))
 
 
 def export_csv(results, path_text):
@@ -403,15 +382,7 @@ def export_csv(results, path_text):
         path = Path(__file__).parent / path
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fieldnames = [
-        "id", "condition_name", "search_date", "code", "name", "market",
-        "grade", "grade_v21", "strategy_v21", "s_score", "e_score",
-        "trigger_path", "close_price", "day_return", "bb_width", "vol_ratio_20",
-        "entry_date", "entry_price", "exit_date", "exit_price", "exit_reason",
-        "holding_days", "policy_target", "policy_stop", "policy_max_days", "position_pct",
-        "gross_return", "net_return", "weighted_net_return", "max_intratrade_return", "min_intratrade_return",
-        "ret_1w", "ret_2w", "ret_3w", "ret_1m", "ret_max", "candle_count",
-    ]
+    fieldnames = ["id", "condition_name", "search_date", "code", "name", "market", "grade", "grade_v21", "strategy_v21", "s_score", "e_score", "trigger_path", "close_price", "day_return", "bb_width", "vol_ratio_20", "entry_date", "entry_price", "exit_date", "exit_price", "exit_reason", "holding_days", "policy_target", "policy_stop", "policy_max_days", "position_pct", "gross_return", "net_return", "weighted_net_return", "max_intratrade_return", "min_intratrade_return", "ret_1w", "ret_2w", "ret_3w", "ret_1m", "ret_max", "candle_count"]
 
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -427,7 +398,7 @@ def parse_args():
     parser.add_argument("--start", default=None, help="search_date 시작일 YYYY-MM-DD")
     parser.add_argument("--end", default=None, help="search_date 종료일 YYYY-MM-DD")
     parser.add_argument("--limit", type=int, default=None, help="테스트용 최대 처리 건수")
-    parser.add_argument("--include-disabled", action="store_true", help="C_WATCH/C_BAD/D까지 결과에 포함")
+    parser.add_argument("--include-disabled", action="store_true", help="C_HOT/C_WATCH/C_BAD/D까지 결과에 포함")
     parser.add_argument("--same-day-policy", choices=["stop_first", "target_first", "open_proximity"], default="stop_first")
     parser.add_argument("--buy-fee-pct", type=float, default=0.015)
     parser.add_argument("--sell-fee-pct", type=float, default=0.015)
@@ -451,26 +422,14 @@ def main():
     backtest_conn = get_conn(DBConfig.BACKTEST_DB)
     stock_conn = get_conn(DBConfig.STOCK_DATA_DB)
     try:
-        rows = fetch_scan_rows(
-            conn=backtest_conn,
-            condition_name=args.condition_name,
-            start_date=args.start,
-            end_date=args.end,
-            enabled_only=(not args.include_disabled),
-            limit=args.limit,
-        )
+        rows = fetch_scan_rows(backtest_conn, args.condition_name, args.start, args.end, enabled_only=(not args.include_disabled), limit=args.limit)
         logger.info("scan_result 로딩 완료: %s건", len(rows))
 
         results = []
         for idx, row in enumerate(rows, 1):
             grade = row.get("grade_v21")
             policy = POLICIES.get(grade, POLICIES["D"])
-            candles = fetch_future_candles(
-                conn=stock_conn,
-                code=row.get("code"),
-                search_date=safe_date_text(row.get("search_date")),
-                max_days=policy["max_days"],
-            )
+            candles = fetch_future_candles(stock_conn, row.get("code"), safe_date_text(row.get("search_date")), policy["max_days"])
             results.append(simulate_one(row, candles, args))
             if idx % 500 == 0:
                 logger.info("진행: %s / %s", idx, len(rows))
