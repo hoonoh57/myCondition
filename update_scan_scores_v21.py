@@ -1,9 +1,8 @@
 """
 scan_result v2.1 등급 영구 저장 스크립트
 
-목적:
-    기존 v2.0 s_score/e_score/grade는 보존하고,
-    v2.1 등급체계 결과를 별도 컬럼에 저장합니다.
+기존 v2.0 s_score/e_score/grade는 보존하고,
+v2.1 등급체계 결과를 별도 컬럼에 저장합니다.
 
 추가 컬럼:
     grade_v21
@@ -11,17 +10,6 @@ scan_result v2.1 등급 영구 저장 스크립트
     score_version_v21
     grade_v21_details
     scored_at_v21
-
-v2.1 룰:
-    A1      : S >= 70 and E >= 60
-    A2      : S >= 70 and E < 60
-    B1      : 50 <= S < 70 and E >= 60
-    B2      : 50 <= S < 70 and E < 60
-    C_HOT   : S < 50 and E >= 60 중 S >= 35 and E >= 80 and close_price < 10000
-    C_FAST  : 남은 C 중 E >= 80 and bb_width >= 40
-    C_WATCH : 남은 C 중 E >= 80 or trigger is event/E-series
-    C_BAD   : 나머지 C
-    D       : S < 50 and E < 60
 
 Usage:
     python update_scan_scores_v21.py --dry-run --limit 20
@@ -34,7 +22,8 @@ import json
 import logging
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pymysql
@@ -52,7 +41,7 @@ logging.basicConfig(
     handlers=[
         logging.FileHandler(
             LOG_DIR / f"update_scan_scores_v21_{datetime.now():%Y%m%d_%H%M%S}.log",
-            encoding="utf-8"
+            encoding="utf-8",
         ),
         logging.StreamHandler(sys.stdout),
     ],
@@ -64,78 +53,15 @@ V21_ORDER = ["A1", "A2", "B1", "B2", "C_HOT", "C_FAST", "C_WATCH", "C_BAD", "D"]
 
 
 V21_STRATEGY = {
-    "A1": {
-        "position_pct": 100,
-        "target_return": 30.0,
-        "stop_loss": -5.0,
-        "max_holding_days": 20,
-        "style": "swing",
-        "description": "최우선: 안정성+폭발력 모두 우수",
-    },
-    "A2": {
-        "position_pct": 80,
-        "target_return": 20.0,
-        "stop_loss": -4.0,
-        "max_holding_days": 20,
-        "style": "swing_stability",
-        "description": "안정우선: 폭발력은 낮지만 1개월 안정성 우수",
-    },
-    "B1": {
-        "position_pct": 60,
-        "target_return": 25.0,
-        "stop_loss": -5.0,
-        "max_holding_days": 10,
-        "style": "short_swing_explosion",
-        "description": "폭발후보: 단기 스윙형",
-    },
-    "B2": {
-        "position_pct": 50,
-        "target_return": 15.0,
-        "stop_loss": -4.0,
-        "max_holding_days": 10,
-        "style": "short_term_standard",
-        "description": "표준 단기형",
-    },
-    "C_HOT": {
-        "position_pct": 50,
-        "target_return": 20.0,
-        "stop_loss": -5.0,
-        "max_holding_days": 10,
-        "style": "promoted_low_price_hot",
-        "description": "C 승격: 저가+고E+S35 이상. C 내부 최우수 후보",
-    },
-    "C_FAST": {
-        "position_pct": 30,
-        "target_return": 15.0,
-        "stop_loss": -4.0,
-        "max_holding_days": 3,
-        "style": "fast_explosion_only",
-        "description": "초단기 폭발 감시군: 1개월 보유 금지",
-    },
-    "C_WATCH": {
-        "position_pct": 10,
-        "target_return": 10.0,
-        "stop_loss": -3.0,
-        "max_holding_days": 3,
-        "style": "watch_only",
-        "description": "관찰군: 조건식 후속 검증 필요",
-    },
-    "C_BAD": {
-        "position_pct": 0,
-        "target_return": 0.0,
-        "stop_loss": 0.0,
-        "max_holding_days": 0,
-        "style": "skip_bad_c",
-        "description": "C 내부 저품질: 제외",
-    },
-    "D": {
-        "position_pct": 0,
-        "target_return": 0.0,
-        "stop_loss": 0.0,
-        "max_holding_days": 0,
-        "style": "skip_d",
-        "description": "패스",
-    },
+    "A1": {"position_pct": 100, "target_return": 30.0, "stop_loss": -5.0, "max_holding_days": 20, "style": "swing", "description": "최우선: 안정성+폭발력 모두 우수"},
+    "A2": {"position_pct": 80, "target_return": 20.0, "stop_loss": -4.0, "max_holding_days": 20, "style": "swing_stability", "description": "안정우선: 폭발력은 낮지만 1개월 안정성 우수"},
+    "B1": {"position_pct": 60, "target_return": 25.0, "stop_loss": -5.0, "max_holding_days": 10, "style": "short_swing_explosion", "description": "폭발후보: 단기 스윙형"},
+    "B2": {"position_pct": 50, "target_return": 15.0, "stop_loss": -4.0, "max_holding_days": 10, "style": "short_term_standard", "description": "표준 단기형"},
+    "C_HOT": {"position_pct": 50, "target_return": 20.0, "stop_loss": -5.0, "max_holding_days": 10, "style": "promoted_low_price_hot", "description": "C 승격: 저가+고E+S35 이상. C 내부 최우수 후보"},
+    "C_FAST": {"position_pct": 30, "target_return": 15.0, "stop_loss": -4.0, "max_holding_days": 3, "style": "fast_explosion_only", "description": "초단기 폭발 감시군: 1개월 보유 금지"},
+    "C_WATCH": {"position_pct": 10, "target_return": 10.0, "stop_loss": -3.0, "max_holding_days": 3, "style": "watch_only", "description": "관찰군: 조건식 후속 검증 필요"},
+    "C_BAD": {"position_pct": 0, "target_return": 0.0, "stop_loss": 0.0, "max_holding_days": 0, "style": "skip_bad_c", "description": "C 내부 저품질: 제외"},
+    "D": {"position_pct": 0, "target_return": 0.0, "stop_loss": 0.0, "max_holding_days": 0, "style": "skip_d", "description": "패스"},
 }
 
 
@@ -149,27 +75,10 @@ V21_COLUMNS = {
 
 
 SELECT_COLUMNS = [
-    "id",
-    "condition_name",
-    "search_date",
-    "code",
-    "name",
-    "market",
-    "trigger_path",
-    "close_price",
-    "day_return",
-    "bb_width",
-    "vol_ratio_20",
-    "ret_1w",
-    "ret_2w",
-    "ret_3w",
-    "ret_1m",
-    "ret_max",
-    "s_score",
-    "e_score",
-    "grade",
-    "grade_v21",
-    "score_version_v21",
+    "id", "condition_name", "search_date", "code", "name", "market",
+    "trigger_path", "close_price", "day_return", "bb_width", "vol_ratio_20",
+    "ret_1w", "ret_2w", "ret_3w", "ret_1m", "ret_max",
+    "s_score", "e_score", "grade", "grade_v21", "score_version_v21",
 ]
 
 
@@ -193,6 +102,15 @@ def safe_float(value, default=0.0):
         return float(value)
     except Exception:
         return default
+
+
+def json_default(value):
+    """pymysql이 반환하는 Decimal/date/datetime 값을 JSON 저장 가능 형태로 변환합니다."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 def table_has_column(cur, table_name, column_name):
@@ -282,22 +200,18 @@ def classify_v21(row):
 
     if s_score >= 70:
         return "A1" if e_score >= 60 else "A2"
-
     if s_score >= 50:
         return "B1" if e_score >= 60 else "B2"
-
     if e_score < 60:
         return "D"
 
+    # 기존 C 영역: S < 50 and E >= 60
     if s_score >= 35 and e_score >= 80 and close_price < 10000:
         return "C_HOT"
-
     if e_score >= 80 and bb_width >= 40:
         return "C_FAST"
-
     if e_score >= 80 or is_event_or_e_series(row):
         return "C_WATCH"
-
     return "C_BAD"
 
 
@@ -365,10 +279,10 @@ def make_payload(row):
         "grade_v20": row.get("grade"),
         "grade_v21": grade_v21,
         "rule_inputs": {
-            "s_score": row.get("s_score"),
-            "e_score": row.get("e_score"),
-            "close_price": row.get("close_price"),
-            "bb_width": row.get("bb_width"),
+            "s_score": safe_float(row.get("s_score")),
+            "e_score": safe_float(row.get("e_score")),
+            "close_price": safe_float(row.get("close_price")),
+            "bb_width": safe_float(row.get("bb_width")),
             "trigger_norm": norm_trigger(row.get("trigger_path")),
             "trigger_path": row.get("trigger_path"),
         },
@@ -383,7 +297,7 @@ def make_payload(row):
         "grade_v21": grade_v21,
         "strategy_v21": strategy["style"],
         "score_version_v21": VERSION,
-        "grade_v21_details": json.dumps(details, ensure_ascii=False, separators=(",", ":")),
+        "grade_v21_details": json.dumps(details, ensure_ascii=False, separators=(",", ":"), default=json_default),
     }
 
 
