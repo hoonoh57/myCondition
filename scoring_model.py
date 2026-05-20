@@ -1,23 +1,40 @@
 """
-스코어링 모델 v2.0 — 2축 스코어링 (안정성 + 폭발력)
+스코어링 모델 v2.1 — 2축 스코어링 (안정성 + 폭발력) + 클러스터 보너스
 
-백테스트 3,860건(하락장 1,959 + 상승장 1,901) 데이터 기반
-두 개의 독립적 점수를 산출하여 매트릭스 등급을 부여합니다.
+v2.0 대비 변경사항:
+    - 클러스터 보너스 시스템 추가 (+15 ~ -10점)
+    - 6단계 cluster_label: A_SEMI_CLUSTER / B_COOL_ELEC / B2_WARM_ELEC /
+                            C_OTHER_CLUSTER / D_NO_CLUSTER / X_HOT_AVOID
+    - 최종 E-Score에 클러스터 보너스를 가산 (0~100 범위 클램프)
+    - 등급 매트릭스는 보너스 반영된 E-Score로 판정
 
-    S-Score (Stability, 0-100): 1개월 수익 안정성 예측
-    E-Score (Explosion, 0-100): 최고 수익 폭발력 예측
-    Grade: S/E 매트릭스 → A1/A2/B1/B2/C/D
+    검증 근거 (Q21, 3,714건):
+        A_SEMI_CLUSTER (+15): avg_1m +7.4%, 승률 55.4% (83건)
+        B_COOL_ELEC    (+10): avg_1m +5.6%, 승률 45.5% (66건)
+        B2_WARM_ELEC    (+3): avg_1m +2.5%, 승률 43.6% (78건)
+        D_NO_CLUSTER     (0): avg_1m +0.4%, 승률 39.7% (3128건)
+        C_OTHER_CLUSTER (-3): avg_1m -2.3%, 승률 29.9% (328건)
+        X_HOT_AVOID    (-10): avg_1m -5.3%, 승률 29.0% (31건)
 
 Usage:
     from scoring_model import ScoringModelV2
     model = ScoringModelV2()
+
+    # v2.0 호환 (클러스터 정보 없이)
     result = model.score({...})
+
+    # v2.1 클러스터 보너스 포함
+    result = model.score({...}, cluster_info={
+        'sector': '코스닥 기계·장비',
+        'sector_cnt': 4,
+        'cluster_avg_day_ret': 7.2
+    })
 """
 
 
 class ScoringModelV2:
     """
-    2-Axis Scoring Model v2.0
+    2-Axis Scoring Model v2.1
 
     S-Score (안정성, 100점):
         F1. 트리거 경로           : 25점
@@ -34,20 +51,20 @@ class ScoringModelV2:
         G4. 볼린저밴드 폭         : 15점
         G5. 트리거 경로           : 10점
 
-    데이터 근거:
-        - P1(2024/05~2025/05 하락/횡보장): 1,959건
-        - P2(2025/05~2026/05 상승장):      1,901건
-        - 폭발(50%+) 261건 vs 일반(<50%) 3,599건 특성 비교
+    Cluster Bonus (-10 ~ +15):
+        H1. 업종 클러스터 분류     : E-Score에 가산, 0~100 클램프
     """
 
-    VERSION = "2.0"
+    VERSION = "2.1"
 
-    # ── 등급 매트릭스 ──
-    #       E-Score
-    #       High(≥60)   Low(<60)
-    # S≥70  A1(최우선)  A2(안정우선)
-    # S≥50  B1(폭발후보) B2(표준)
-    # S<50  C(관망)      D(패스)
+    CLUSTER_BONUS = {
+        'A_SEMI_CLUSTER':  15,
+        'B_COOL_ELEC':     10,
+        'B2_WARM_ELEC':     3,
+        'D_NO_CLUSTER':     0,
+        'C_OTHER_CLUSTER': -3,
+        'X_HOT_AVOID':    -10,
+    }
 
     GRADE_STRATEGY = {
         'A1': {
@@ -94,30 +111,27 @@ class ScoringModelV2:
         },
     }
 
-    def score(self, data: dict) -> dict:
-        """
-        Parameters:
-            data: dict with keys:
-                - trigger_path:    str
-                - ma60_200_dist:   float (%)
-                - rsi14:           float
-                - bb_width:        float
-                - vol_ratio_20:    float
-                - ma60_slope_up:   int/bool
-                - ma200_slope_up:  int/bool
-                - close_price:     float (원)
-                - day_return:      float (%)
+    @staticmethod
+    def classify_cluster(cluster_info: dict) -> str:
+        if cluster_info is None:
+            return 'D_NO_CLUSTER'
+        sector = cluster_info.get('sector') or ''
+        cnt = cluster_info.get('sector_cnt', 0)
+        avg_dr = cluster_info.get('cluster_avg_day_ret', 0)
+        if cnt < 3:
+            return 'D_NO_CLUSTER'
+        if sector == '코스닥 기계·장비':
+            return 'A_SEMI_CLUSTER'
+        if sector == '코스닥 전기·전자':
+            if avg_dr < 7:
+                return 'B_COOL_ELEC'
+            elif avg_dr < 10:
+                return 'B2_WARM_ELEC'
+            else:
+                return 'X_HOT_AVOID'
+        return 'C_OTHER_CLUSTER'
 
-        Returns:
-            dict with keys:
-                - s_score:         int (0-100, 안정성)
-                - e_score:         int (0-100, 폭발력)
-                - grade:           str ('A1'/'A2'/'B1'/'B2'/'C'/'D')
-                - s_factors:       dict (S 팩터별 점수)
-                - e_factors:       dict (E 팩터별 점수)
-                - strategy:        dict
-                - details:         str
-        """
+    def score(self, data: dict, cluster_info: dict = None) -> dict:
         # ══════════ S-Score (안정성) ══════════
         sf = {}
         sf['F1_trigger'] = self._s_trigger(data.get('trigger_path', ''))
@@ -137,10 +151,16 @@ class ScoringModelV2:
         ef['G3_vol_ratio'] = self._e_vol_ratio(data.get('vol_ratio_20'))
         ef['G4_bb_width'] = self._e_bb_width(data.get('bb_width'))
         ef['G5_trigger'] = self._e_trigger(data.get('trigger_path', ''))
-        e_score = sum(ef.values())
+        e_score_raw = sum(ef.values())
+
+        # ══════════ Cluster Bonus (v2.1) ══════════
+        cluster_label = self.classify_cluster(cluster_info)
+        cluster_bonus = self.CLUSTER_BONUS[cluster_label]
+        e_score = max(0, min(100, e_score_raw + cluster_bonus))
 
         # ══════════ 등급 결정 ══════════
         grade = self._get_grade(s_score, e_score)
+        grade_v20 = self._get_grade(s_score, e_score_raw)
         strategy = self.GRADE_STRATEGY[grade]
 
         s_detail = ' | '.join(f"{k}={v}" for k, v in sf.items())
@@ -148,25 +168,31 @@ class ScoringModelV2:
 
         return {
             's_score': s_score,
+            'e_score_raw': e_score_raw,
+            'cluster_bonus': cluster_bonus,
+            'cluster_label': cluster_label,
             'e_score': e_score,
             'grade': grade,
+            'grade_v20': grade_v20,
             's_factors': sf,
             'e_factors': ef,
             'strategy': strategy,
-            'details': f"S[{s_detail}]={s_score} | E[{e_detail}]={e_score}",
+            'details': (
+                f"S[{s_detail}]={s_score} | "
+                f"E[{e_detail}]={e_score_raw} "
+                f"+cluster({cluster_label}:{cluster_bonus:+d})={e_score}"
+            ),
         }
 
     # ═══════════════════════════════════════════
-    #  S-Score 팩터 (안정성 — 1m 수익 예측)
+    #  S-Score 팩터 (안정성)
     # ═══════════════════════════════════════════
 
     def _s_trigger(self, tp: str) -> int:
-        """F1: 트리거 경로 (최대 25점) — 1m 기준 최적"""
         tp = tp.lower() if tp else ''
         has_d = 'd_ma60gc' in tp
         has_e = 'e_ma200gc' in tp
         has_c = 'c_rsi70' in tp
-
         if has_d and has_e and not has_c:
             return 25
         if has_d and not has_e and not has_c:
@@ -184,7 +210,6 @@ class ScoringModelV2:
         return 10
 
     def _s_ma_dist(self, dist) -> int:
-        """F2: 60/200 이격률 (최대 20점)"""
         if dist is None:
             return 10
         dist = float(dist)
@@ -198,7 +223,6 @@ class ScoringModelV2:
             return 0
 
     def _s_rsi(self, rsi_val) -> int:
-        """F3: RSI (최대 15점)"""
         if rsi_val is None:
             return 8
         rsi_val = float(rsi_val)
@@ -210,7 +234,6 @@ class ScoringModelV2:
             return 0
 
     def _s_bb_width(self, bw) -> int:
-        """F4: BB 폭 (최대 15점) — 좁을수록 안정"""
         if bw is None:
             return 8
         bw = float(bw)
@@ -226,7 +249,6 @@ class ScoringModelV2:
             return 0
 
     def _s_vol_ratio(self, vr) -> int:
-        """F5: 거래량 비율 (최대 15점)"""
         if vr is None:
             return 5
         vr = float(vr)
@@ -242,7 +264,6 @@ class ScoringModelV2:
             return 3
 
     def _s_slope(self, ma60_up, ma200_up) -> int:
-        """F6: MA 기울기 조합 (최대 10점)"""
         if ma60_up is None or ma200_up is None:
             return 5
         if int(ma60_up) == 1 and int(ma200_up) == 1:
@@ -255,20 +276,10 @@ class ScoringModelV2:
             return 0
 
     # ═══════════════════════════════════════════
-    #  E-Score 팩터 (폭발력 — max 수익 예측)
+    #  E-Score 팩터 (폭발력)
     # ═══════════════════════════════════════════
 
     def _e_price(self, price) -> int:
-        """
-        G1: 종가 수준 (최대 30점)
-
-        근거:
-          CP1 초저가(<3천): 50%+ 확률 11.1%, 100%+ 3.5% → 폭발력 최강
-          CP2 저가(3천-1만): 50%+ 6.3%, 100%+ 1.0%
-          CP3 중가(1-3만): 50%+ 7.8%, 100%+ 0.8%
-          CP4 고가(3-10만): 50%+ 3.2%, 100%+ 0.0%
-          CP5 초고가(10만+): 50%+ 2.4%, 100%+ 0.0%
-        """
         if price is None:
             return 15
         price = float(price)
@@ -284,15 +295,6 @@ class ScoringModelV2:
             return 0
 
     def _e_day_return(self, dr) -> int:
-        """
-        G2: 당일 등락률 (최대 25점)
-
-        근거:
-          DR5 급등(15%+): 50%+ 확률 10.2% → 최고 폭발
-          DR4 강양봉(7-15%): 50%+ 8.2%
-          DR3 중간(3-7%): 50%+ 5.7%
-          DR2 소폭(0-3%): 50%+ 5.0%
-        """
         if dr is None:
             return 10
         dr = float(dr)
@@ -305,14 +307,9 @@ class ScoringModelV2:
         elif dr >= 0:
             return 5
         else:
-            return 0   # 음봉
+            return 0
 
     def _e_vol_ratio(self, vr) -> int:
-        """
-        G3: 거래량 비율 (최대 20점)
-
-        근거: 폭발 종목 avg 6.3~7.4x vs 일반 5.6x
-        """
         if vr is None:
             return 8
         vr = float(vr)
@@ -330,11 +327,6 @@ class ScoringModelV2:
             return 0
 
     def _e_bb_width(self, bw) -> int:
-        """
-        G4: BB 폭 (최대 15점) — 넓을수록 폭발 (안정성과 반대)
-
-        근거: 폭발 종목 avg BW 22~26 vs 일반 19.5
-        """
         if bw is None:
             return 8
         bw = float(bw)
@@ -350,12 +342,6 @@ class ScoringModelV2:
             return 0
 
     def _e_trigger(self, tp: str) -> int:
-        """
-        G5: 트리거 경로 (최대 10점) — 폭발 확률 기준
-
-        근거: event의 HIGH 비중 11.9% (vs NORMAL 6.5%)
-              E 37.2% vs 35.7% — 약간 높음
-        """
         tp = tp.lower() if tp else ''
         if tp == 'event':
             return 10
@@ -372,14 +358,6 @@ class ScoringModelV2:
     # ═══════════════════════════════════════════
 
     def _get_grade(self, s: int, e: int) -> str:
-        """
-        S/E 매트릭스 → 등급
-
-                    E ≥ 60      E < 60
-        S ≥ 70      A1          A2
-        50 ≤ S < 70 B1          B2
-        S < 50      C           D
-        """
         if s >= 70:
             return 'A1' if e >= 60 else 'A2'
         elif s >= 50:
@@ -388,85 +366,93 @@ class ScoringModelV2:
             return 'C' if e >= 60 else 'D'
 
 
-# ── 편의 함수 ──
 def score_stock(**kwargs) -> dict:
-    """단일 종목 간편 스코어링"""
-    return ScoringModelV2().score(kwargs)
+    cluster = kwargs.pop('cluster_info', None)
+    return ScoringModelV2().score(kwargs, cluster_info=cluster)
 
 
-# ── 테스트 ──
 if __name__ == '__main__':
     model = ScoringModelV2()
 
-    print("=" * 80)
-    print("  스코어링 모델 v2.0 (2축: 안정성 S + 폭발력 E)")
-    print("=" * 80)
+    print("=" * 90)
+    print("  스코어링 모델 v2.1 (2축: 안정성 S + 폭발력 E + 클러스터 보너스)")
+    print("=" * 90)
 
     tests = [
         {
-            'label': '기가레인 (실제 +427.67%)',
+            'label': '기가레인 (실제 +427%) — 클러스터 없음',
             'data': {
                 'trigger_path': 'trend:D_MA60GC+E_MA200GC',
                 'ma60_200_dist': 1.5, 'rsi14': 52.0,
                 'bb_width': 12.0, 'vol_ratio_20': 8.5,
                 'ma60_slope_up': 1, 'ma200_slope_up': 1,
                 'close_price': 1579, 'day_return': 12.5,
-            }
+            },
+            'cluster': None,
         },
         {
-            'label': '케이씨에스 (실제 +193.80%)',
+            'label': '반도체장비 클러스터 (A_SEMI +15)',
             'data': {
-                'trigger_path': 'trend:D_MA60GC',
-                'ma60_200_dist': 4.5, 'rsi14': 58.0,
-                'bb_width': 15.0, 'vol_ratio_20': 6.0,
-                'ma60_slope_up': 1, 'ma200_slope_up': 0,
-                'close_price': 9360, 'day_return': 8.2,
-            }
-        },
-        {
-            'label': '삼성화재 (실제 +8.01%, 안정형)',
-            'data': {
-                'trigger_path': 'trend:D_MA60GC',
-                'ma60_200_dist': 2.0, 'rsi14': 55.0,
-                'bb_width': 14.0, 'vol_ratio_20': 2.5,
+                'trigger_path': 'trend:D_MA60GC+E_MA200GC',
+                'ma60_200_dist': 3.0, 'rsi14': 55.0,
+                'bb_width': 18.0, 'vol_ratio_20': 6.0,
                 'ma60_slope_up': 1, 'ma200_slope_up': 1,
-                'close_price': 350000, 'day_return': 2.5,
-            }
+                'close_price': 8000, 'day_return': 7.5,
+            },
+            'cluster': {'sector': '코스닥 기계·장비', 'sector_cnt': 4, 'cluster_avg_day_ret': 7.5},
         },
         {
-            'label': '저품질 (C단독+대이격+과매수)',
+            'label': '전기전자 Cool 클러스터 (B_COOL +10)',
+            'data': {
+                'trigger_path': 'trend:E_MA200GC',
+                'ma60_200_dist': 5.0, 'rsi14': 58.0,
+                'bb_width': 15.0, 'vol_ratio_20': 4.0,
+                'ma60_slope_up': 1, 'ma200_slope_up': 0,
+                'close_price': 5000, 'day_return': 5.5,
+            },
+            'cluster': {'sector': '코스닥 전기·전자', 'sector_cnt': 3, 'cluster_avg_day_ret': 5.5},
+        },
+        {
+            'label': '전기전자 Hot 과열 (X_HOT -10)',
             'data': {
                 'trigger_path': 'trend:C_RSI70',
                 'ma60_200_dist': 18.0, 'rsi14': 75.0,
                 'bb_width': 45.0, 'vol_ratio_20': 12.0,
                 'ma60_slope_up': 0, 'ma200_slope_up': 0,
                 'close_price': 8000, 'day_return': 18.0,
-            }
+            },
+            'cluster': {'sector': '코스닥 전기·전자', 'sector_cnt': 5, 'cluster_avg_day_ret': 15.0},
         },
         {
-            'label': '초저가 폭발후보 (E단독+저가+급등)',
+            'label': '기타 업종 클러스터 (C_OTHER -3)',
             'data': {
-                'trigger_path': 'trend:E_MA200GC',
-                'ma60_200_dist': 10.0, 'rsi14': 72.0,
-                'bb_width': 35.0, 'vol_ratio_20': 15.0,
-                'ma60_slope_up': 0, 'ma200_slope_up': 0,
-                'close_price': 1500, 'day_return': 20.0,
-            }
+                'trigger_path': 'trend:D_MA60GC',
+                'ma60_200_dist': 4.0, 'rsi14': 60.0,
+                'bb_width': 20.0, 'vol_ratio_20': 3.0,
+                'ma60_slope_up': 1, 'ma200_slope_up': 0,
+                'close_price': 12000, 'day_return': 6.0,
+            },
+            'cluster': {'sector': '코스닥 유통', 'sector_cnt': 3, 'cluster_avg_day_ret': 5.0},
         },
     ]
 
     for i, t in enumerate(tests, 1):
-        r = model.score(t['data'])
+        r = model.score(t['data'], cluster_info=t.get('cluster'))
+        upgrade = ""
+        if r['grade'] != r['grade_v20']:
+            upgrade = f" (v2.0:{r['grade_v20']} -> v2.1:{r['grade']})"
         print(f"\n[{i}] {t['label']}")
-        print(f"    S-Score: {r['s_score']}/100  E-Score: {r['e_score']}/100  등급: {r['grade']}")
-        print(f"    S: {' | '.join(f'{k}={v}' for k,v in r['s_factors'].items())}")
-        print(f"    E: {' | '.join(f'{k}={v}' for k,v in r['e_factors'].items())}")
+        print(f"    S={r['s_score']}  E_raw={r['e_score_raw']}  "
+              f"cluster={r['cluster_label']}({r['cluster_bonus']:+d})  "
+              f"E_final={r['e_score']}  등급={r['grade']}{upgrade}")
         print(f"    전략: {r['strategy']['description']}")
 
-    print(f"\n{'=' * 80}")
-    print("  등급 매트릭스:")
-    print("               E ≥ 60 (폭발력↑)    E < 60 (폭발력↓)")
-    print("  S ≥ 70       A1 (최우선)          A2 (안정우선)")
-    print("  50 ≤ S < 70  B1 (폭발후보)        B2 (표준)")
-    print("  S < 50       C  (관망)            D  (패스)")
-    print(f"{'=' * 80}")
+    print(f"\n{'=' * 90}")
+    print("  클러스터 보너스 배점표:")
+    print("  A_SEMI_CLUSTER  +15  코스닥 기계·장비 3종목+")
+    print("  B_COOL_ELEC     +10  코스닥 전기·전자 3종목+ & avg_day_ret <7%")
+    print("  B2_WARM_ELEC     +3  코스닥 전기·전자 3종목+ & 7~10%")
+    print("  D_NO_CLUSTER      0  클러스터 미해당 (베이스라인)")
+    print("  C_OTHER_CLUSTER  -3  기타 업종 3종목+")
+    print("  X_HOT_AVOID     -10  코스닥 전기·전자 3종목+ & 10%+")
+    print(f"{'=' * 90}")
