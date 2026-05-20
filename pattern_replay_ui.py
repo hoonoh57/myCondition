@@ -1,14 +1,12 @@
-"""
-패턴 리플레이 UI
+﻿"""
+패턴 리플레이 UI  v2.1
 
-현재 백테스트/차트 검증 화면을 확장하여 다음 기능을 제공합니다.
-
-- 기간/패턴/등급/Max% 필터
-- 후보 종목 리스트에 체크, 신뢰점수총점, 대응패턴 표시
-- 포착 전 N봉 + 포착 후 M봉 일봉 차트
-- 체크 종목 또는 현재 조회 전체를 대상으로 수급/테마/뉴스 수동 분석 다이얼로그
-- 등록된 보조 점수는 outputs/reports/manual_supply_scores.csv에 저장
-- 저장된 점수는 메인 UI 신뢰점수와 상세 정보에 즉시 반영
+v2.1 변경사항:
+    - SCAN_COLUMNS에 cluster_label, cluster_bonus, e_score_raw, grade_v20 추가
+    - Treeview에 Clx(클러스터 레이블) 컬럼 추가
+    - update_info에 [클러스터] 라인 추가
+    - compute_context에 클러스터 보너스 반영
+    - 전략분석 탭에 클러스터별 성과 요약 추가
 
 실행:
     python pattern_replay_ui.py
@@ -34,33 +32,50 @@ from matplotlib.patches import Rectangle
 from config import BacktestConfig, DBConfig
 
 
+# ──────────────────────────────────────────────
+# 상수
+# ──────────────────────────────────────────────
 REPORT_DIR = Path(__file__).parent / "outputs" / "reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 MANUAL_SCORE_CSV = REPORT_DIR / "manual_supply_scores.csv"
 
-PATTERN_ITEMS = ["ALL", "A_EVENT_LIMITLIKE", "B_D_E_GOLDEN_CORE", "C_D_ONLY_60GC", "D_E_ONLY_200GC", "E_RSI_E_MIXED", "F_RSI_D_MIXED", "G_RSI_ONLY", "H_COMPLEX_CDE", "Z_OTHER"]
-GRADE_ITEMS = ["ALL", "A1", "A2", "B1", "B2", "C_HOT", "C_FAST", "C_WATCH", "C_BAD", "D"]
+PATTERN_ITEMS = [
+    "ALL", "A_EVENT_LIMITLIKE", "B_D_E_GOLDEN_CORE", "C_D_ONLY_60GC",
+    "D_E_ONLY_200GC", "E_RSI_E_MIXED", "F_RSI_D_MIXED", "G_RSI_ONLY",
+    "H_COMPLEX_CDE", "Z_OTHER",
+]
+GRADE_ITEMS = [
+    "ALL", "A1", "A2", "B1", "B2",
+    "C_HOT", "C_FAST", "C_WATCH", "C_BAD", "D",
+]
 MAX_FILTER_ITEMS = ["ALL", ">=5", ">=10", ">=20", ">=30", ">=50", ">=100"]
 
+CLUSTER_LABEL_ITEMS = [
+    "ALL", "A_SEMI_CLUSTER", "B_COOL_ELEC", "B2_WARM_ELEC",
+    "C_OTHER_CLUSTER", "D_NO_CLUSTER", "X_HOT_AVOID",
+]
+
+# v2.1: cluster 관련 컬럼 추가
 SCAN_COLUMNS = [
     "id", "condition_name", "search_date", "code", "name", "market",
     "trigger_path", "close_price", "volume", "trade_value", "day_return",
     "ma60_200_dist", "rsi14", "bb_width", "vol_ratio_20",
     "ma60_slope_up", "ma200_slope_up",
     "ret_1w", "ret_2w", "ret_3w", "ret_1m", "ret_max", "max_high_date",
-    "s_score", "e_score", "grade", "grade_v21", "strategy_v21",
+    "s_score", "e_score", "e_score_raw", "cluster_bonus", "cluster_label",
+    "grade", "grade_v20", "grade_v21", "strategy_v21",
 ]
 
 POLICIES = {
-    "A1": {"target": 30.0, "stop": -5.0, "max_days": 20, "enabled": True, "label": "스윙 최우선"},
-    "A2": {"target": 20.0, "stop": -4.0, "max_days": 20, "enabled": True, "label": "안정 스윙"},
-    "B1": {"target": 25.0, "stop": -5.0, "max_days": 10, "enabled": True, "label": "단기 폭발"},
-    "B2": {"target": 15.0, "stop": -4.0, "max_days": 10, "enabled": True, "label": "표준 단기"},
-    "C_FAST": {"target": 15.0, "stop": -6.0, "max_days": 2, "enabled": True, "label": "초단기 폭발"},
-    "C_HOT": {"target": 8.0, "stop": -8.0, "max_days": 2, "enabled": False, "label": "장중 확인 후보"},
-    "C_WATCH": {"target": 0.0, "stop": 0.0, "max_days": 0, "enabled": False, "label": "관찰"},
-    "C_BAD": {"target": 0.0, "stop": 0.0, "max_days": 0, "enabled": False, "label": "제외"},
-    "D": {"target": 0.0, "stop": 0.0, "max_days": 0, "enabled": False, "label": "제외"},
+    "A1":      {"target": 30.0, "stop": -5.0,  "max_days": 20, "enabled": True,  "label": "스윙 최우선"},
+    "A2":      {"target": 20.0, "stop": -4.0,  "max_days": 20, "enabled": True,  "label": "안정 스윙"},
+    "B1":      {"target": 25.0, "stop": -5.0,  "max_days": 10, "enabled": True,  "label": "단기 폭발"},
+    "B2":      {"target": 15.0, "stop": -4.0,  "max_days": 10, "enabled": True,  "label": "표준 단기"},
+    "C_FAST":  {"target": 15.0, "stop": -6.0,  "max_days": 2,  "enabled": True,  "label": "초단기 폭발"},
+    "C_HOT":   {"target": 8.0,  "stop": -8.0,  "max_days": 2,  "enabled": False, "label": "장중 확인 후보"},
+    "C_WATCH": {"target": 0.0,  "stop":  0.0,  "max_days": 0,  "enabled": False, "label": "관찰"},
+    "C_BAD":   {"target": 0.0,  "stop":  0.0,  "max_days": 0,  "enabled": False, "label": "제외"},
+    "D":       {"target": 0.0,  "stop":  0.0,  "max_days": 0,  "enabled": False, "label": "제외"},
 }
 
 PATTERN_GUIDES = {
@@ -75,10 +90,40 @@ PATTERN_GUIDES = {
     "Z_OTHER": "기타 패턴. 별도 검증 전에는 주력 사용 금지.",
 }
 
-GRADE_BASE = {"A1": 35.0, "A2": 28.0, "B1": 26.0, "B2": 18.0, "C_FAST": 22.0, "C_HOT": 12.0, "C_WATCH": 5.0, "C_BAD": -10.0, "D": -15.0}
-PATTERN_BASE = {"A_EVENT_LIMITLIKE": 22.0, "C_D_ONLY_60GC": 20.0, "B_D_E_GOLDEN_CORE": 18.0, "D_E_ONLY_200GC": 12.0, "E_RSI_E_MIXED": 8.0, "F_RSI_D_MIXED": 5.0, "H_COMPLEX_CDE": 5.0, "G_RSI_ONLY": -8.0, "Z_OTHER": 0.0}
+# 클러스터 레이블 가이드 (v2.1 신규)
+CLUSTER_GUIDES = {
+    "A_SEMI_CLUSTER": "코스닥 기계·장비 반도체장비 클러스터. 승률 70.8%, avg_1m +7.0%. 동일 업종 ≥3종목 동시 포착. 가장 안정적인 클러스터 신호.",
+    "B_COOL_ELEC": "코스닥 전기·전자 Cool(avg_day_ret<7%) 클러스터. 승률 55%, avg_1m +4.7%. 조용한 돌파가 더 좋은 성과.",
+    "B2_WARM_ELEC": "코스닥 전기·전자 Warm(7~10%) 클러스터. 승률 43.6%, avg_1m +2.5%. 중간 온도, 기대수익 낮음.",
+    "C_OTHER_CLUSTER": "기타 업종 ≥3종목 동시 포착. 평균 성과 부정적(avg_1m -2.3%). 과열 가능성 높음.",
+    "D_NO_CLUSTER": "클러스터 미해당. 베이스라인 성과(avg_1m +0.4%).",
+    "X_HOT_AVOID": "코스닥 전기·전자 Hot(avg_day_ret≥10%) 클러스터. 승률 20%, avg_1m -5.9%. 회피 권장.",
+}
+
+GRADE_BASE = {
+    "A1": 35.0, "A2": 28.0, "B1": 26.0, "B2": 18.0,
+    "C_FAST": 22.0, "C_HOT": 12.0, "C_WATCH": 5.0, "C_BAD": -10.0, "D": -15.0,
+}
+PATTERN_BASE = {
+    "A_EVENT_LIMITLIKE": 22.0, "C_D_ONLY_60GC": 20.0, "B_D_E_GOLDEN_CORE": 18.0,
+    "D_E_ONLY_200GC": 12.0, "E_RSI_E_MIXED": 8.0, "F_RSI_D_MIXED": 5.0,
+    "H_COMPLEX_CDE": 5.0, "G_RSI_ONLY": -8.0, "Z_OTHER": 0.0,
+}
+
+# v2.1 클러스터 보너스 → context_score에 반영
+CLUSTER_CONTEXT_BONUS = {
+    "A_SEMI_CLUSTER": 12.0,
+    "B_COOL_ELEC": 8.0,
+    "B2_WARM_ELEC": 2.0,
+    "D_NO_CLUSTER": 0.0,
+    "C_OTHER_CLUSTER": -3.0,
+    "X_HOT_AVOID": -8.0,
+}
 
 
+# ──────────────────────────────────────────────
+# 유틸리티
+# ──────────────────────────────────────────────
 def get_conn(database_name=None):
     return pymysql.connect(
         host=DBConfig.HOST,
@@ -100,6 +145,15 @@ def safe_float(value, default=0.0):
         if math.isnan(v):
             return default
         return v
+    except Exception:
+        return default
+
+
+def safe_int(value, default=0):
+    if value is None:
+        return default
+    try:
+        return int(value)
     except Exception:
         return default
 
@@ -161,6 +215,22 @@ def pattern_group(row):
     return "Z_OTHER"
 
 
+def cluster_label_short(label):
+    """Treeview 표시용 축약"""
+    mapping = {
+        "A_SEMI_CLUSTER": "A_Semi",
+        "B_COOL_ELEC": "B_Cool",
+        "B2_WARM_ELEC": "B2_Warm",
+        "C_OTHER_CLUSTER": "C_Oth",
+        "D_NO_CLUSTER": "-",
+        "X_HOT_AVOID": "X_Hot",
+    }
+    return mapping.get(label, str(label or "-")[:6])
+
+
+# ──────────────────────────────────────────────
+# 수동 점수 관리
+# ──────────────────────────────────────────────
 def load_manual_scores():
     scores = {}
     if not MANUAL_SCORE_CSV.exists():
@@ -181,7 +251,10 @@ def load_manual_scores():
 
 
 def save_manual_scores(scores):
-    fieldnames = ["search_date", "code", "program_score", "institution_score", "foreign_score", "theme_score", "news_score", "note", "updated_at"]
+    fieldnames = [
+        "search_date", "code", "program_score", "institution_score",
+        "foreign_score", "theme_score", "news_score", "note", "updated_at",
+    ]
     with MANUAL_SCORE_CSV.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -203,13 +276,23 @@ def save_manual_scores(scores):
 def manual_score_total(manual):
     if not manual:
         return 0.0
-    return safe_float(manual.get("program")) + safe_float(manual.get("institution")) + safe_float(manual.get("foreign")) + safe_float(manual.get("theme")) + safe_float(manual.get("news"))
+    return (
+        safe_float(manual.get("program"))
+        + safe_float(manual.get("institution"))
+        + safe_float(manual.get("foreign"))
+        + safe_float(manual.get("theme"))
+        + safe_float(manual.get("news"))
+    )
 
 
+# ──────────────────────────────────────────────
+# 신뢰판정 (v2.1: 클러스터 보너스 반영)
+# ──────────────────────────────────────────────
 def compute_context(row, manual_scores):
     pg = pattern_group(row)
     grade = str(row.get("grade_v21") or "")
     score = GRADE_BASE.get(grade, 0.0) + PATTERN_BASE.get(pg, 0.0)
+
     trade_value = safe_float(row.get("trade_value"))
     vol_ratio = safe_float(row.get("vol_ratio_20"))
     day_return = safe_float(row.get("day_return"))
@@ -217,41 +300,56 @@ def compute_context(row, manual_scores):
     rsi = safe_float(row.get("rsi14"))
     s_score = safe_float(row.get("s_score"))
     e_score = safe_float(row.get("e_score"))
-    if trade_value >= 100000000000:
+
+    if trade_value >= 100_000_000_000:
         score += 12.0
-    elif trade_value >= 30000000000:
+    elif trade_value >= 30_000_000_000:
         score += 8.0
-    elif trade_value >= 10000000000:
+    elif trade_value >= 10_000_000_000:
         score += 5.0
+
     if vol_ratio >= 20:
         score += 10.0
     elif vol_ratio >= 10:
         score += 7.0
     elif vol_ratio >= 5:
         score += 4.0
+
     if 3.0 <= day_return <= 18.0:
         score += 6.0
     elif day_return > 25.0:
         score -= 5.0
+
     if s_score >= 70:
         score += 8.0
     elif s_score >= 50:
         score += 4.0
+
     if e_score >= 80:
         score += 8.0
     elif e_score >= 60:
         score += 4.0
+
     if 10.0 <= bb_width <= 40.0:
         score += 4.0
     elif bb_width > 60.0:
         score -= 3.0
+
     if rsi >= 85.0:
         score -= 4.0
+
     if pg == "G_RSI_ONLY":
         score -= 10.0
+
     if grade in ("C_BAD", "D"):
         score -= 20.0
+
+    # v2.1: 클러스터 보너스 반영
+    clx = str(row.get("cluster_label") or "D_NO_CLUSTER")
+    score += CLUSTER_CONTEXT_BONUS.get(clx, 0.0)
+
     score += manual_score_total(manual_scores.get(row_key(row)))
+
     if grade in ("D", "C_BAD"):
         action = "SKIP"
     elif pg == "G_RSI_ONLY" and score < 70:
@@ -264,9 +362,13 @@ def compute_context(row, manual_scores):
         action = "CONFIRM"
     else:
         action = "WATCH"
+
     return score, action
 
 
+# ──────────────────────────────────────────────
+# DB 조회
+# ──────────────────────────────────────────────
 def build_query(start_text, end_text, grade):
     clauses = ["condition_name = %s"]
     params = [BacktestConfig.CONDITION_NAME]
@@ -288,7 +390,7 @@ def build_query(start_text, end_text, grade):
     return sql, params
 
 
-def fetch_scan_rows(start_text, end_text, pattern, grade, max_filter):
+def fetch_scan_rows(start_text, end_text, pattern, grade, max_filter, cluster_filter="ALL"):
     conn = get_conn(DBConfig.BACKTEST_DB)
     try:
         sql, params = build_query(start_text, end_text, grade)
@@ -297,11 +399,16 @@ def fetch_scan_rows(start_text, end_text, pattern, grade, max_filter):
             rows = cur.fetchall()
     finally:
         conn.close()
+
     if pattern and pattern != "ALL":
         rows = [row for row in rows if pattern_group(row) == pattern]
     if max_filter and max_filter != "ALL":
         threshold = safe_float(max_filter.replace(">=", ""))
         rows = [row for row in rows if safe_float(row.get("ret_max")) >= threshold]
+    # v2.1: 클러스터 필터
+    if cluster_filter and cluster_filter != "ALL":
+        rows = [row for row in rows if str(row.get("cluster_label") or "") == cluster_filter]
+
     return rows
 
 
@@ -340,15 +447,18 @@ def fetch_candles(code, center_date_text, before_bars=20, after_bars=120, warmup
             after_rows = list(cur.fetchall())
     finally:
         conn.close()
+
     before_rows.reverse()
     df = _rows_to_df(before_rows + after_rows)
     if df.empty:
         return df
+
     df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma60"] = df["close"].rolling(60).mean()
     df["ma200"] = df["close"].rolling(200).mean()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
+
     signal_dt = pd.to_datetime(center_date_text)
     display_before = df[df["date"] < signal_dt].tail(before_bars)
     display_after = df[df["date"] >= signal_dt].head(after_bars)
@@ -360,23 +470,35 @@ def fetch_candles(code, center_date_text, before_bars=20, after_bars=120, warmup
     return out
 
 
+# ──────────────────────────────────────────────
+# 매매 시뮬레이션
+# ──────────────────────────────────────────────
 def simulate_policy(row, candles):
     grade = row.get("grade_v21")
     policy = POLICIES.get(grade, POLICIES["D"])
     entry_price = safe_float(row.get("close_price"))
-    result = {"enabled": policy["enabled"], "label": policy["label"], "target": policy["target"], "stop": policy["stop"], "max_days": policy["max_days"], "exit_date": "", "exit_price": 0.0, "exit_reason": "disabled", "gross_return": 0.0, "net_return": 0.0}
+    result = {
+        "enabled": policy["enabled"], "label": policy["label"],
+        "target": policy["target"], "stop": policy["stop"],
+        "max_days": policy["max_days"],
+        "exit_date": "", "exit_price": 0.0,
+        "exit_reason": "disabled", "gross_return": 0.0, "net_return": 0.0,
+    }
     if not policy["enabled"] or entry_price <= 0 or candles.empty:
         return result
+
     signal_dt = pd.to_datetime(safe_date_text(row.get("search_date")))
     future = candles[candles["date"] > signal_dt].head(policy["max_days"])
     if future.empty:
         result["exit_reason"] = "no_future_candle"
         return result
+
     target_price = entry_price * (1.0 + policy["target"] / 100.0)
     stop_price = entry_price * (1.0 + policy["stop"] / 100.0)
     exit_price = 0.0
     exit_reason = ""
     exit_date = ""
+
     for _, candle in future.iterrows():
         high_price = safe_float(candle.get("high"))
         low_price = safe_float(candle.get("low"))
@@ -400,11 +522,18 @@ def simulate_policy(row, candles):
         exit_price = close_price
         exit_reason = "time_exit"
         exit_date = candle_date
+
     gross = (exit_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
-    result.update({"exit_date": exit_date, "exit_price": exit_price, "exit_reason": exit_reason, "gross_return": gross, "net_return": gross - 0.53})
+    result.update({
+        "exit_date": exit_date, "exit_price": exit_price,
+        "exit_reason": exit_reason, "gross_return": gross, "net_return": gross - 0.53,
+    })
     return result
 
 
+# ──────────────────────────────────────────────
+# 차트 그리기
+# ──────────────────────────────────────────────
 def draw_candles(ax, df):
     if df.empty:
         return
@@ -418,15 +547,22 @@ def draw_candles(ax, df):
         height = abs(c - o)
         if height == 0:
             height = max(c * 0.001, 1.0)
-        ax.vlines(i, l, h, linewidth=0.8)
-        ax.add_patch(Rectangle((i - width / 2.0, lower), width, height, fill=False, linewidth=0.9))
+        color = "r" if c >= o else "b"
+        ax.vlines(i, l, h, color=color, linewidth=0.8)
+        ax.add_patch(Rectangle(
+            (i - width / 2.0, lower), width, height,
+            fill=(c >= o), facecolor=color, edgecolor=color, linewidth=0.9,
+        ))
     x = list(range(len(df)))
-    ax.plot(x, df["close"], linewidth=0.9, label="Close")
+    ax.plot(x, df["close"], linewidth=0.9, alpha=0.5, label="Close")
     ax.plot(x, df["ma20"], linewidth=1.0, label="MA20")
     ax.plot(x, df["ma60"], linewidth=1.0, label="MA60")
     ax.plot(x, df["ma200"], linewidth=1.0, label="MA200")
 
 
+# ──────────────────────────────────────────────
+# 수급 다이얼로그
+# ──────────────────────────────────────────────
 class SupplyDialog(tk.Toplevel):
     def __init__(self, master, rows, on_apply):
         super().__init__(master)
@@ -472,11 +608,14 @@ class SupplyDialog(tk.Toplevel):
         self.destroy()
 
 
+# ──────────────────────────────────────────────
+# 메인 UI
+# ──────────────────────────────────────────────
 class PatternReplayUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("myCondition Pattern Replay UI")
-        self.geometry("1780x980")
+        self.title("myCondition Pattern Replay UI v2.1")
+        self.geometry("1860x1000")
         self.rows = []
         self.checked = set()
         self.manual_scores = load_manual_scores()
@@ -490,40 +629,64 @@ class PatternReplayUI(tk.Tk):
         root.add(left, weight=1)
         root.add(right, weight=4)
 
+        # ── 필터 ──
         filter_box = ttk.LabelFrame(left, text="Filter", padding=8)
         filter_box.pack(fill=tk.X)
+
         ttk.Label(filter_box, text="Start").grid(row=0, column=0, sticky=tk.W)
         self.start_var = tk.StringVar(value="2024-05-20")
         ttk.Entry(filter_box, textvariable=self.start_var, width=12).grid(row=0, column=1, sticky=tk.W, padx=4)
+
         ttk.Label(filter_box, text="End").grid(row=1, column=0, sticky=tk.W)
         self.end_var = tk.StringVar(value=date.today().isoformat())
         ttk.Entry(filter_box, textvariable=self.end_var, width=12).grid(row=1, column=1, sticky=tk.W, padx=4)
+
         ttk.Label(filter_box, text="Pattern").grid(row=2, column=0, sticky=tk.W)
         self.pattern_var = tk.StringVar(value="ALL")
         ttk.Combobox(filter_box, textvariable=self.pattern_var, values=PATTERN_ITEMS, state="readonly", width=24).grid(row=2, column=1, sticky=tk.W, padx=4)
+
         ttk.Label(filter_box, text="Grade").grid(row=3, column=0, sticky=tk.W)
         self.grade_var = tk.StringVar(value="ALL")
         ttk.Combobox(filter_box, textvariable=self.grade_var, values=GRADE_ITEMS, state="readonly", width=12).grid(row=3, column=1, sticky=tk.W, padx=4)
+
         ttk.Label(filter_box, text="Max%").grid(row=4, column=0, sticky=tk.W)
         self.max_filter_var = tk.StringVar(value="ALL")
         ttk.Combobox(filter_box, textvariable=self.max_filter_var, values=MAX_FILTER_ITEMS, state="readonly", width=12).grid(row=4, column=1, sticky=tk.W, padx=4)
-        ttk.Label(filter_box, text="Before").grid(row=5, column=0, sticky=tk.W)
-        self.before_var = tk.StringVar(value="20")
-        ttk.Entry(filter_box, textvariable=self.before_var, width=8).grid(row=5, column=1, sticky=tk.W, padx=4)
-        ttk.Label(filter_box, text="After").grid(row=6, column=0, sticky=tk.W)
-        self.after_var = tk.StringVar(value="120")
-        ttk.Entry(filter_box, textvariable=self.after_var, width=8).grid(row=6, column=1, sticky=tk.W, padx=4)
-        ttk.Button(filter_box, text="조회", command=self.load_rows).grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=5)
-        ttk.Button(filter_box, text="선택 체크/해제", command=self.toggle_selected).grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=2)
-        ttk.Button(filter_box, text="체크 수급분석", command=self.open_checked_supply).grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=2)
-        ttk.Button(filter_box, text="조회전체 수급분석", command=self.open_all_supply).grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=2)
 
+        # v2.1: 클러스터 필터 추가
+        ttk.Label(filter_box, text="Cluster").grid(row=5, column=0, sticky=tk.W)
+        self.cluster_var = tk.StringVar(value="ALL")
+        ttk.Combobox(filter_box, textvariable=self.cluster_var, values=CLUSTER_LABEL_ITEMS, state="readonly", width=20).grid(row=5, column=1, sticky=tk.W, padx=4)
+
+        ttk.Label(filter_box, text="Before").grid(row=6, column=0, sticky=tk.W)
+        self.before_var = tk.StringVar(value="20")
+        ttk.Entry(filter_box, textvariable=self.before_var, width=8).grid(row=6, column=1, sticky=tk.W, padx=4)
+
+        ttk.Label(filter_box, text="After").grid(row=7, column=0, sticky=tk.W)
+        self.after_var = tk.StringVar(value="120")
+        ttk.Entry(filter_box, textvariable=self.after_var, width=8).grid(row=7, column=1, sticky=tk.W, padx=4)
+
+        ttk.Button(filter_box, text="조회", command=self.load_rows).grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=5)
+        ttk.Button(filter_box, text="선택 체크/해제", command=self.toggle_selected).grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=2)
+        ttk.Button(filter_box, text="체크 수급분석", command=self.open_checked_supply).grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=2)
+        ttk.Button(filter_box, text="조회전체 수급분석", command=self.open_all_supply).grid(row=11, column=0, columnspan=2, sticky=tk.EW, pady=2)
+
+        # ── 후보 리스트 ──
         list_box = ttk.LabelFrame(left, text="Candidates", padding=4)
         list_box.pack(fill=tk.BOTH, expand=True, pady=8)
-        columns = ("chk", "date", "code", "name", "pattern", "grade", "retmax", "ctx", "action", "s", "e")
+        # v2.1: clx 컬럼 추가
+        columns = ("chk", "date", "code", "name", "pattern", "grade", "retmax", "clx", "ctx", "action", "s", "e")
         self.tree = ttk.Treeview(list_box, columns=columns, show="headings", height=28)
-        headings = {"chk": "✓", "date": "Date", "code": "Code", "name": "Name", "pattern": "Pattern", "grade": "G", "retmax": "Max%", "ctx": "Ctx", "action": "Action", "s": "S", "e": "E"}
-        widths = {"chk": 30, "date": 82, "code": 66, "name": 115, "pattern": 135, "grade": 62, "retmax": 62, "ctx": 55, "action": 76, "s": 42, "e": 42}
+        headings = {
+            "chk": "✓", "date": "Date", "code": "Code", "name": "Name",
+            "pattern": "Pattern", "grade": "G", "retmax": "Max%",
+            "clx": "Clx", "ctx": "Ctx", "action": "Action", "s": "S", "e": "E",
+        }
+        widths = {
+            "chk": 30, "date": 82, "code": 66, "name": 115, "pattern": 135,
+            "grade": 62, "retmax": 62, "clx": 62, "ctx": 55, "action": 76,
+            "s": 42, "e": 42,
+        }
         for col in columns:
             self.tree.heading(col, text=headings[col])
             self.tree.column(col, width=widths[col], anchor=tk.W)
@@ -536,6 +699,7 @@ class PatternReplayUI(tk.Tk):
         self.count_var = tk.StringVar(value="0 rows")
         ttk.Label(left, textvariable=self.count_var).pack(anchor=tk.W)
 
+        # ── 차트 ──
         chart_box = ttk.LabelFrame(right, text="Chart Replay", padding=4)
         chart_box.pack(fill=tk.BOTH, expand=True)
         self.fig = Figure(figsize=(12, 7), dpi=100)
@@ -545,11 +709,13 @@ class PatternReplayUI(tk.Tk):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         toolbar = NavigationToolbar2Tk(self.canvas, chart_box)
         toolbar.update()
-        info_box = ttk.LabelFrame(right, text="Logic / Pattern Guide / Trade Result", padding=8)
+
+        info_box = ttk.LabelFrame(right, text="Logic / Pattern / Cluster Guide / Trade Result", padding=8)
         info_box.pack(fill=tk.X, pady=8)
-        self.info_text = tk.Text(info_box, height=13, wrap=tk.WORD)
+        self.info_text = tk.Text(info_box, height=15, wrap=tk.WORD)
         self.info_text.pack(fill=tk.X)
 
+    # ── 행 갱신 ──
     def row_context(self, row):
         return compute_context(row, self.manual_scores)
 
@@ -557,18 +723,40 @@ class PatternReplayUI(tk.Tk):
         row = self.rows[idx]
         ctx, action = self.row_context(row)
         key = row_key(row)
-        self.tree.item(str(idx), values=("☑" if key in self.checked else "☐", safe_date_text(row.get("search_date")), row.get("code"), row.get("name"), pattern_group(row), row.get("grade_v21"), f"{safe_float(row.get('ret_max')):.2f}", f"{ctx:.1f}", action, row.get("s_score"), row.get("e_score")))
+        clx = cluster_label_short(row.get("cluster_label"))
+        self.tree.item(str(idx), values=(
+            "☑" if key in self.checked else "☐",
+            safe_date_text(row.get("search_date")),
+            row.get("code"),
+            row.get("name"),
+            pattern_group(row),
+            row.get("grade_v21"),
+            f"{safe_float(row.get('ret_max')):.2f}",
+            clx,
+            f"{ctx:.1f}",
+            action,
+            row.get("s_score"),
+            row.get("e_score"),
+        ))
 
     def load_rows(self):
         try:
-            self.rows = fetch_scan_rows(self.start_var.get().strip(), self.end_var.get().strip(), self.pattern_var.get().strip(), self.grade_var.get().strip(), self.max_filter_var.get().strip())
+            self.rows = fetch_scan_rows(
+                self.start_var.get().strip(),
+                self.end_var.get().strip(),
+                self.pattern_var.get().strip(),
+                self.grade_var.get().strip(),
+                self.max_filter_var.get().strip(),
+                self.cluster_var.get().strip(),
+            )
         except Exception as ex:
             messagebox.showerror("DB 조회 실패", str(ex))
             return
+
         self.checked = set()
         self.tree.delete(*self.tree.get_children())
         for idx, _row in enumerate(self.rows):
-            self.tree.insert("", tk.END, iid=str(idx), values=("", "", "", "", "", "", "", "", "", "", ""))
+            self.tree.insert("", tk.END, iid=str(idx), values=("",) * 12)
             self.refresh_tree_row(idx)
         self.count_var.set(f"{len(self.rows)} rows")
         if self.rows:
@@ -636,7 +824,12 @@ class PatternReplayUI(tk.Tk):
         try:
             before_bars = int(self.before_var.get().strip())
             after_bars = int(self.after_var.get().strip())
-            candles = fetch_candles(row.get("code"), safe_date_text(row.get("search_date")), before_bars=before_bars, after_bars=after_bars)
+            candles = fetch_candles(
+                row.get("code"),
+                safe_date_text(row.get("search_date")),
+                before_bars=before_bars,
+                after_bars=after_bars,
+            )
         except Exception as ex:
             messagebox.showerror("캔들 조회 실패", str(ex))
             return
@@ -651,45 +844,60 @@ class PatternReplayUI(tk.Tk):
             self.ax_price.set_title("No candle data")
             self.canvas.draw()
             return
+
         signal_date_text = safe_date_text(row.get("search_date"))
         signal_idx_list = candles.index[candles["date"] == pd.to_datetime(signal_date_text)].tolist()
         signal_idx = signal_idx_list[0] if signal_idx_list else None
+
         max_high_date = safe_date_text(row.get("max_high_date"))
         max_idx = None
         if max_high_date:
             max_idx_list = candles.index[candles["date"] == pd.to_datetime(max_high_date)].tolist()
             max_idx = max_idx_list[0] if max_idx_list else None
+
         entry_price = safe_float(row.get("close_price"))
         grade = row.get("grade_v21")
         policy = POLICIES.get(grade, POLICIES["D"])
         target_price = entry_price * (1.0 + policy["target"] / 100.0) if policy["target"] != 0 else None
         stop_price = entry_price * (1.0 + policy["stop"] / 100.0) if policy["stop"] != 0 else None
+
         draw_candles(self.ax_price, candles)
+
         if signal_idx is not None:
-            self.ax_price.axvline(signal_idx, linestyle="--", linewidth=1.3, label="Signal")
-            self.ax_vol.axvline(signal_idx, linestyle="--", linewidth=1.0)
+            self.ax_price.axvline(signal_idx, color="purple", linestyle="--", linewidth=1.3, label="Signal")
+            self.ax_vol.axvline(signal_idx, color="purple", linestyle="--", linewidth=1.0)
         if max_idx is not None:
-            self.ax_price.axvline(max_idx, linestyle=":", linewidth=1.2, label="MaxHigh")
+            self.ax_price.axvline(max_idx, color="green", linestyle=":", linewidth=1.2, label="MaxHigh")
         if entry_price > 0:
-            self.ax_price.axhline(entry_price, linestyle="--", linewidth=0.9, label="Entry")
+            self.ax_price.axhline(entry_price, color="gray", linestyle="--", linewidth=0.9, label="Entry")
         if target_price:
-            self.ax_price.axhline(target_price, linestyle="-.", linewidth=0.9, label="Target")
+            self.ax_price.axhline(target_price, color="red", linestyle="-.", linewidth=0.9, label="Target")
         if stop_price:
-            self.ax_price.axhline(stop_price, linestyle="-.", linewidth=0.9, label="Stop")
+            self.ax_price.axhline(stop_price, color="blue", linestyle="-.", linewidth=0.9, label="Stop")
+
         exit_date = trade_result.get("exit_date")
         if exit_date:
             exit_idx_list = candles.index[candles["date"] == pd.to_datetime(exit_date)].tolist()
             if exit_idx_list:
-                self.ax_price.axvline(exit_idx_list[0], linestyle="-.", linewidth=1.2, label="Exit")
-        title = f"{signal_date_text} {row.get('code')} {row.get('name')} | {pattern_group(row)} | {grade} | retMax {safe_float(row.get('ret_max')):.2f}%"
-        self.ax_price.set_title(title)
+                self.ax_price.axvline(exit_idx_list[0], color="orange", linestyle="-.", linewidth=1.2, label="Exit")
+
+        # v2.1: 타이틀에 클러스터 레이블 추가
+        clx = cluster_label_short(row.get("cluster_label"))
+        title = (
+            f"{signal_date_text} {row.get('code')} {row.get('name')} | "
+            f"{pattern_group(row)} | {grade} | Clx:{clx} | "
+            f"retMax {safe_float(row.get('ret_max')):.2f}%"
+        )
+        self.ax_price.set_title(title, fontsize=10)
         self.ax_price.grid(True, alpha=0.25)
         self.ax_price.legend(loc="upper left", fontsize=8)
+
         x = list(range(len(candles)))
-        self.ax_vol.bar(x, candles["volume"], width=0.65, label="Volume")
-        self.ax_vol.plot(x, candles["vol_ma20"], linewidth=1.0, label="VolMA20")
+        self.ax_vol.bar(x, candles["volume"], width=0.65, color="gray", alpha=0.6, label="Volume")
+        self.ax_vol.plot(x, candles["vol_ma20"], linewidth=1.0, color="orange", label="VolMA20")
         self.ax_vol.grid(True, alpha=0.25)
         self.ax_vol.legend(loc="upper left", fontsize=8)
+
         step = max(1, len(candles) // 10)
         ticks = list(range(0, len(candles), step))
         labels = [safe_date_text(candles.iloc[i]["date"])[5:] for i in ticks]
@@ -709,6 +917,14 @@ class PatternReplayUI(tk.Tk):
         last_date = candles.attrs.get("last_date", "") if not candles.empty else ""
         ctx, action = self.row_context(row)
         manual = self.manual_scores.get(row_key(row), {})
+
+        # v2.1: 클러스터 정보
+        clx_label = str(row.get("cluster_label") or "D_NO_CLUSTER")
+        clx_bonus = safe_int(row.get("cluster_bonus"))
+        e_raw = safe_int(row.get("e_score_raw"))
+        e_final = safe_int(row.get("e_score"))
+        clx_guide = CLUSTER_GUIDES.get(clx_label, "")
+
         lines = []
         lines.append(f"[종목] {safe_date_text(row.get('search_date'))} {row.get('code')} {row.get('name')} / {row.get('market')}")
         lines.append(f"[신뢰판정] context_score={ctx:.1f} / action={action} / manual_supply_total={manual_score_total(manual):.1f}")
@@ -717,8 +933,9 @@ class PatternReplayUI(tk.Tk):
             lines.append(f"[수급메모] {manual.get('note')}")
         lines.append(f"[차트범위] before={before_count}봉 / after={after_count}봉 / {first_date} ~ {last_date}")
         lines.append(f"[패턴] {pg} / trigger_path={row.get('trigger_path')}")
-        lines.append(f"[등급] v20={row.get('grade')} / v21={grade} / strategy={row.get('strategy_v21')}")
-        lines.append(f"[스코어] S={row.get('s_score')} E={row.get('e_score')} / RSI14={safe_float(row.get('rsi14')):.2f} / MA60-200 dist={safe_float(row.get('ma60_200_dist')):.2f}")
+        lines.append(f"[등급] v20={row.get('grade_v20')} / v21={grade} / strategy={row.get('strategy_v21')}")
+        lines.append(f"[스코어] S={row.get('s_score')} E_raw={e_raw} + cluster_bonus={clx_bonus:+d} = E={e_final} / RSI14={safe_float(row.get('rsi14')):.2f} / MA60-200 dist={safe_float(row.get('ma60_200_dist')):.2f}")
+        lines.append(f"[클러스터] label={clx_label} / bonus={clx_bonus:+d} / {clx_guide}")
         lines.append(f"[지표] day_return={safe_float(row.get('day_return')):.2f}% / vol_ratio20={safe_float(row.get('vol_ratio_20')):.2f} / BB width={safe_float(row.get('bb_width')):.2f}")
         lines.append(f"[성과] ret_1w={safe_float(row.get('ret_1w')):.2f}% / ret_2w={safe_float(row.get('ret_2w')):.2f}% / ret_3w={safe_float(row.get('ret_3w')):.2f}% / ret_1m={safe_float(row.get('ret_1m')):.2f}% / ret_max={safe_float(row.get('ret_max')):.2f}%")
         lines.append(f"[매매정책] {policy['label']} / enabled={policy['enabled']} / target={policy['target']}% / stop={policy['stop']}% / max_days={policy['max_days']}")
